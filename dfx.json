@@ -4,6 +4,11 @@
       "type": "motoko",
       "main": "examples/hoosat_ecdsa/main.mo",
       "init_cycles": 2000000000000
+    },
+    "hrc20_example": {
+      "type": "motoko",
+      "main": "examples/hrc20_example/main.mo",
+      "init_cycles": 2000000000000
     }
   },
   "defaults": {
