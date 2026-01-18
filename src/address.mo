@@ -220,29 +220,62 @@ module {
         };
     };
 
+    // Generate address with explicit prefix (for testnet/devnet compatibility)
+    // This is a convenience wrapper around generateAddress for kaspa API compatibility
+    public func generateAddressWithPrefix(pubkey : Blob, addr_type : Nat, prefix : Text) : Result<AddressInfo> {
+        generateAddress(pubkey, addr_type, ?prefix)
+    };
+
     // Decode address with comprehensive validation
+    // Auto-detects prefix if not provided (supports hoosat: and hoosattest:)
     public func decodeAddress(address: Text, prefix : ?Text) : Result<AddressInfo> {
         // Basic validation
         if (Text.size(address) == 0) {
             return #err(Errors.invalidAddress("Address cannot be empty"));
         };
 
-        let network_prefix = switch (prefix) {
-            case (null) { "Hoosat" };
-            case (?p) { p };
-        };
-        let expected_prefix = network_prefix # ":";
-
-        if (not Text.startsWith(address, #text(expected_prefix))) {
-            return #err(Errors.invalidAddress("Address must start with '" # expected_prefix # "' prefix"));
-        };
-
-        // Core address decoding logic (avoiding circular dependency)
-        let stripped = switch (Text.stripStart(address, #text(expected_prefix))) {
-            case (null) {
-                return #err(Errors.invalidAddress("Failed to strip '" # expected_prefix # "' prefix"));
+        // Auto-detect prefix if not provided
+        let (network_prefix, stripped) = switch (prefix) {
+            case (?p) {
+                // Use provided prefix
+                let expected_prefix = p # ":";
+                if (not Text.startsWith(address, #text(expected_prefix))) {
+                    return #err(Errors.invalidAddress("Address must start with '" # expected_prefix # "' prefix"));
+                };
+                switch (Text.stripStart(address, #text(expected_prefix))) {
+                    case (null) {
+                        return #err(Errors.invalidAddress("Failed to strip '" # expected_prefix # "' prefix"));
+                    };
+                    case (?s) { (p, s) };
+                };
             };
-            case (?addr) { addr };
+            case (null) {
+                // Auto-detect: check for testnet first (longer prefix), then mainnet
+                // Support both lowercase (hoosat/hoosattest) and capitalized (Hoosat/Hoosattest)
+                if (Text.startsWith(address, #text("hoosattest:"))) {
+                    switch (Text.stripStart(address, #text("hoosattest:"))) {
+                        case (null) { return #err(Errors.invalidAddress("Failed to strip 'hoosattest:' prefix")) };
+                        case (?s) { ("hoosattest", s) };
+                    };
+                } else if (Text.startsWith(address, #text("Hoosattest:"))) {
+                    switch (Text.stripStart(address, #text("Hoosattest:"))) {
+                        case (null) { return #err(Errors.invalidAddress("Failed to strip 'Hoosattest:' prefix")) };
+                        case (?s) { ("Hoosattest", s) };
+                    };
+                } else if (Text.startsWith(address, #text("hoosat:"))) {
+                    switch (Text.stripStart(address, #text("hoosat:"))) {
+                        case (null) { return #err(Errors.invalidAddress("Failed to strip 'hoosat:' prefix")) };
+                        case (?s) { ("hoosat", s) };
+                    };
+                } else if (Text.startsWith(address, #text("Hoosat:"))) {
+                    switch (Text.stripStart(address, #text("Hoosat:"))) {
+                        case (null) { return #err(Errors.invalidAddress("Failed to strip 'Hoosat:' prefix")) };
+                        case (?s) { ("Hoosat", s) };
+                    };
+                } else {
+                    return #err(Errors.invalidAddress("Address must start with 'hoosat:' or 'hoosattest:' prefix"));
+                };
+            };
         };
 
         // Decode using charset

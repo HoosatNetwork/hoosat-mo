@@ -1086,15 +1086,15 @@ module {
 
     public func createTestnetWallet(key_name: Text, prefix: ?Text) : Wallet {
         let network_prefix = switch (prefix) {
-            case (null) { "Hoosat" };
+            case (null) { "hoosattest" };  // Default testnet prefix
             case (?p) { p };
         };
         let config: WalletConfig = {
             key_name = key_name;
-            api_host = "api-testnet.Hoosat.org";
+            api_host = "api-testnet.hoosat.fi";
             network = "testnet";
             prefix = network_prefix;
-            max_fee = 10_000_000; // Higher for testnet
+            max_fee = 100_000_000_000; // Allow up to 1000 HTN for HRC20 deploys
             default_fee_rate = 1000;
         };
         Wallet(config)

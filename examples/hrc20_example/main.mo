@@ -61,8 +61,8 @@ import HRC20Builder "../../src/hrc20/builder";
 
 persistent actor HRC20Example {
 
-    // Initialize a mainnet wallet (use createTestnetWallet for testnet)
-    transient let wallet = Wallet.createMainnetWallet("dfx_test_key", ?"hoosat");
+    // Initialize a testnet wallet
+    transient let wallet = Wallet.createTestnetWallet("dfx_test_key", null);
 
     // Store pending reveals (survives upgrades)
     private stable var pendingReveals : [(Text, [Nat8])] = [];  // (commit_tx_id, redeem_script)

@@ -404,11 +404,11 @@ persistent actor {
                     };
                 };
 
-                // Test that Hoosat decoder fails on hoosat address
+                // Test that auto-detection works for lowercase hoosat prefix
                 ignore assertResult(
                     Address.decodeAddress(addr_info.address, null),
-                    false,
-                    "Hoosat decoder should reject hoosat address"
+                    true,
+                    "Auto-detect should accept lowercase hoosat address"
                 );
             };
             case (#err(error)) {
