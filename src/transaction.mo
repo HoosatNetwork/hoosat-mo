@@ -226,15 +226,14 @@ module {
             }
         ) # "]";
 
-        "{\"transaction\":{" #
-        "\"version\":" # Nat.toText(Nat16.toNat(tx.version)) # "," #
+        "{\"version\":" # Nat.toText(Nat16.toNat(tx.version)) # "," #
         "\"inputs\":" # inputs_json # "," #
         "\"outputs\":" # outputs_json # "," #
-        "\"lockTime\":" # Nat64.toText(tx.lockTime) # "," #
+        "\"lockTime\":\"" # Nat64.toText(tx.lockTime) # "\"," #
         "\"subnetworkId\":\"" # tx.subnetworkId # "\"," #
-        "\"gas\":" # Nat64.toText(tx.gas) # "," #
-        "\"payload\":\"" # tx.payload # "\"" #
-        "}}"
+        "\"gas\":\"" # Nat64.toText(tx.gas) # "\"," #
+        "\"payload\":\"" # tx.payload # "\"," #
+        "\"allowOrphan\":false}"
     };
 
     /// Build a P2SH commit transaction

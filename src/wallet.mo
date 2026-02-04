@@ -505,8 +505,8 @@ module {
             Blob.fromArray(Buffer.toArray(bytes))
         };
 
-        private func fetchUTXOs(address: Text) : async Result<[ExtendedUTXO]> {
-            let url = "https://" # config.api_host # "/addresses/" # address # "/utxos";
+        private func getCurrentBlockHeight() : async Result<Nat64> {
+            let url = "https://" # config.api_host # "/api/v1/blockchain/count";
             let request_headers = [
                 { name = "Content-Type"; value = "application/json" },
                 { name = "User-Agent"; value = "icp-Hoosat-wallet" }
@@ -515,7 +515,7 @@ module {
             try {
                 let response = await (with cycles = 230_949_972_000) IC.ic.http_request({
                     url = url;
-                    max_response_bytes = ?16384; // Increased for production
+                    max_response_bytes = ?4096;
                     headers = request_headers;
                     body = null;
                     method = #get;
@@ -523,7 +523,92 @@ module {
                     transform = null;
                 });
 
-                if (response.status != 200) {
+                if (response.status != 200 and response.status != 201) {
+                    return #err(Errors.networkError("Failed to get block height: " # debug_show(response.status), ?response.status));
+                };
+
+                let decoded_text = switch (Text.decodeUtf8(response.body)) {
+                    case (null) { return #err(Errors.networkError("Failed to decode block height response", ?response.status)) };
+                    case (?text) { text };
+                };
+
+                switch (Json.parse(decoded_text)) {
+                    case (#err(e)) {
+                        return #err(Errors.internalError("Failed to parse block height JSON: " # debug_show(e)));
+                    };
+                    case (#ok(json)) {
+                        switch (json) {
+                            case (#object_(wrapper)) {
+                                var block_count: ?Nat64 = null;
+                                for ((key, value) in wrapper.vals()) {
+                                    if (key == "data") {
+                                        switch (value) {
+                                            case (#object_(data_fields)) {
+                                                for ((data_key, data_value) in data_fields.vals()) {
+                                                    if (data_key == "blockCount") {
+                                                        switch (data_value) {
+                                                            case (#string(count_str)) {
+                                                                var parsed: Nat64 = 0;
+                                                                for (c in Text.toIter(count_str)) {
+                                                                    if (c >= '0' and c <= '9') {
+                                                                        let digit = Nat32.toNat(Char.toNat32(c) - Char.toNat32('0'));
+                                                                        parsed := parsed * 10 + Nat64.fromNat(digit);
+                                                                    };
+                                                                };
+                                                                block_count := ?parsed;
+                                                            };
+                                                            case (#number(#int(count))) {
+                                                                block_count := ?Nat64.fromNat(Int.abs(count));
+                                                            };
+                                                            case _ {};
+                                                        };
+                                                    };
+                                                };
+                                            };
+                                            case _ {};
+                                        };
+                                    };
+                                };
+                                switch (block_count) {
+                                    case (null) { #err(Errors.internalError("Missing blockCount in response")) };
+                                    case (?count) { #ok(count) };
+                                };
+                            };
+                            case (_) { #err(Errors.internalError("Expected object in block height response")) };
+                        };
+                    };
+                };
+            } catch (e) {
+                #err(Errors.networkError("Failed to get block height: " # Error.message(e), null))
+            }
+        };
+
+        private func fetchUTXOs(address: Text) : async Result<[ExtendedUTXO]> {
+            // Get current block height first
+            let current_height = switch (await getCurrentBlockHeight()) {
+                case (#ok(height)) { height };
+                case (#err(e)) { return #err(e) };
+            };
+
+            let url = "https://" # config.api_host # "/api/v1/address/utxos";
+            let request_body = "{\"addresses\":[\"" # address # "\"]}";
+            let request_headers = [
+                { name = "Content-Type"; value = "application/json" },
+                { name = "User-Agent"; value = "icp-Hoosat-wallet" }
+            ];
+
+            try {
+                let response = await (with cycles = 230_949_972_000) IC.ic.http_request({
+                    url = url;
+                    max_response_bytes = ?2000000; // Max 2MB for large UTXO responses
+                    headers = request_headers;
+                    body = ?Text.encodeUtf8(request_body);
+                    method = #post;
+                    is_replicated = ?false;
+                    transform = null;
+                });
+
+                if (response.status != 200 and response.status != 201) {
                     let decoded_text = switch (Text.decodeUtf8(response.body)) {
                         case (null) { "Unknown error" };
                         case (?text) { text };
@@ -541,40 +626,80 @@ module {
                     case (?text) { text };
                 };
 
-                parseUTXOResponse(decoded_text)
+                parseUTXOResponse(decoded_text, current_height)
             } catch (e) {
                 #err(Errors.networkError("HTTP request failed: " # Error.message(e), null))
             }
         };
 
-        private func parseUTXOResponse(json_text: Text) : Result<[ExtendedUTXO]> {
+        private func parseUTXOResponse(json_text: Text, current_height: Nat64) : Result<[ExtendedUTXO]> {
             switch (Json.parse(json_text)) {
                 case (#err(e)) {
                     #err(Errors.internalError("Failed to parse UTXO JSON: " # debug_show(e)))
                 };
                 case (#ok(json)) {
                     switch (json) {
-                        case (#array(utxos)) {
-                            let result = Buffer.Buffer<ExtendedUTXO>(0);
-                            for (utxo_json in utxos.vals()) {
-                                switch (parseUTXOEntry(utxo_json)) {
-                                    case (#err(error)) { return #err(error) };
-                                    case (#ok(extended_utxo)) {
-                                        result.add(extended_utxo);
+                        case (#object_(wrapper)) {
+                            // Extract "data" field from wrapper
+                            var data_json: ?Json.Json = null;
+                            for ((key, value) in wrapper.vals()) {
+                                if (key == "data") {
+                                    data_json := ?value;
+                                };
+                            };
+                            
+                            switch (data_json) {
+                                case (null) {
+                                    return #err(Errors.internalError("Missing 'data' field in response"));
+                                };
+                                case (?data) {
+                                    // Extract "utxos" array from data
+                                    switch (data) {
+                                        case (#object_(data_fields)) {
+                                            var utxos_array: ?[Json.Json] = null;
+                                            for ((key, value) in data_fields.vals()) {
+                                                if (key == "utxos") {
+                                                    switch (value) {
+                                                        case (#array(arr)) { utxos_array := ?arr };
+                                                        case (_) {};
+                                                    };
+                                                };
+                                            };
+                                            
+                                            switch (utxos_array) {
+                                                case (null) {
+                                                    return #err(Errors.internalError("Missing 'utxos' array in data"));
+                                                };
+                                                case (?utxos) {
+                                                    let result = Buffer.Buffer<ExtendedUTXO>(0);
+                                                    for (utxo_json in utxos.vals()) {
+                                                        switch (parseUTXOEntry(utxo_json, current_height)) {
+                                                            case (#err(error)) { return #err(error) };
+                                                            case (#ok(extended_utxo)) {
+                                                                result.add(extended_utxo);
+                                                            };
+                                                        };
+                                                    };
+                                                    #ok(Buffer.toArray(result))
+                                                };
+                                            };
+                                        };
+                                        case (_) {
+                                            #err(Errors.internalError("Expected data object in response"))
+                                        };
                                     };
                                 };
                             };
-                            #ok(Buffer.toArray(result))
                         };
                         case (_) {
-                            #err(Errors.internalError("Expected UTXO array in response"))
+                            #err(Errors.internalError("Expected object wrapper in response"))
                         };
                     }
                 };
             }
         };
 
-        private func parseUTXOEntry(utxo_json: Json.Json) : Result.Result<ExtendedUTXO, Errors.HoosatError> {
+        private func parseUTXOEntry(utxo_json: Json.Json, current_height: Nat64) : Result.Result<ExtendedUTXO, Errors.HoosatError> {
             switch (utxo_json) {
                 case (#object_(fields)) {
                     // Extract required fields from UTXO JSON according to API docs
@@ -584,6 +709,7 @@ module {
                     var script_public_key: ?Text = null;
                     var address: ?Text = null;
                     var is_coinbase: ?Bool = null;
+                    var block_daa_score: ?Nat64 = null;
 
                     for ((key, value) in fields.vals()) {
                         switch (key) {
@@ -668,6 +794,19 @@ module {
                                                 case ("isCoinbase", #bool(coinbase)) {
                                                     is_coinbase := ?coinbase;
                                                 };
+                                                case ("blockDaaScore", #string(score_str)) {
+                                                    var parsed_score: Nat64 = 0;
+                                                    for (c in Text.toIter(score_str)) {
+                                                        if (c >= '0' and c <= '9') {
+                                                            let digit = Nat32.toNat(Char.toNat32(c) - Char.toNat32('0'));
+                                                            parsed_score := parsed_score * 10 + Nat64.fromNat(digit);
+                                                        };
+                                                    };
+                                                    block_daa_score := ?parsed_score;
+                                                };
+                                                case ("blockDaaScore", #number(#int(score))) {
+                                                    block_daa_score := ?Nat64.fromNat(Int.abs(score));
+                                                };
                                                 case _ {};
                                             };
                                         };
@@ -691,9 +830,21 @@ module {
                                 address = addr;
                             };
 
+                            // Calculate confirmations based on block height
+                            let confirmations = switch (block_daa_score) {
+                                case (null) { 1 }; // Fallback if no blockDaaScore
+                                case (?score) {
+                                    if (current_height > score) {
+                                        Nat64.toNat(current_height - score)
+                                    } else {
+                                        0
+                                    }
+                                };
+                            };
+
                             let extended_utxo: ExtendedUTXO = {
                                 utxo = utxo;
-                                confirmations = 1; // Assume confirmed if returned by API
+                                confirmations = confirmations;
                                 is_coinbase = switch (is_coinbase) { case (?c) c; case null false };
                                 maturity = null;
                             };
@@ -733,13 +884,16 @@ module {
 
                     var total: Nat64 = 0;
                     let selected = Buffer.Buffer<Types.UTXO>(0);
+                    var utxo_count: Nat = 0;
+                    let max_utxos = 10; // Limit to 10 UTXOs to avoid ECDSA signing overload
 
                     label selection for (utxo in sorted.vals()) {
-                        if (total >= required) {
+                        if (total >= required or utxo_count >= max_utxos) {
                             break selection;
                         };
                         selected.add(utxo);
                         total += utxo.amount;
+                        utxo_count += 1;
                     };
 
                     if (total < required) {
@@ -847,7 +1001,7 @@ module {
 
         // Broadcast a signed transaction to the Hoosat network
         private func broadcastTransaction(serialized_tx: Text) : async Result<Text> {
-            let url = "https://" # config.api_host # "/transactions";
+            let url = "https://" # config.api_host # "/api/v1/transaction/submit";
             let request_headers = [
                 { name = "Content-Type"; value = "application/json" },
                 { name = "User-Agent"; value = "Hoosat-production-wallet" }
@@ -867,7 +1021,7 @@ module {
                     transform = null;
                 });
 
-                if (response.status != 200) {
+                if (response.status != 200 and response.status != 201) {
                     let decoded_text = switch (Text.decodeUtf8(response.body)) {
                         case (null) { "Unknown error" };
                         case (?text) { text };
@@ -885,28 +1039,59 @@ module {
                     case (?text) { text };
                 };
 
-                // Parse the response to extract the transaction ID
+                // Parse the response to extract the transaction ID from wrapped format
+                // Response format: {"success": true, "data": {"transactionId": "..."}}
                 switch (Json.parse(decoded_text)) {
                     case (#err(e)) {
                         #err(Errors.internalError("Failed to parse broadcast response JSON: " # debug_show(e)))
                     };
                     case (#ok(json)) {
                         switch (json) {
-                            case (#object_(fields)) {
-                                // Look for transaction ID in the response
-                                for ((key, value) in fields.vals()) {
-                                    switch (key) {
-                                        case ("transactionId" or "txid" or "id") {
-                                            switch (value) {
-                                                case (#string(tx_id)) { return #ok(tx_id) };
+                            case (#object_(wrapper)) {
+                                // Extract "data" field from wrapper
+                                var data_json: ?Json.Json = null;
+                                for ((key, value) in wrapper.vals()) {
+                                    if (key == "data") {
+                                        data_json := ?value;
+                                    };
+                                };
+                                
+                                switch (data_json) {
+                                    case (null) {
+                                        // Try legacy format (direct fields)
+                                        for ((key, value) in wrapper.vals()) {
+                                            switch (key) {
+                                                case ("transactionId" or "txid" or "id") {
+                                                    switch (value) {
+                                                        case (#string(tx_id)) { return #ok(tx_id) };
+                                                        case (_) {};
+                                                    };
+                                                };
                                                 case (_) {};
                                             };
                                         };
-                                        case (_) {};
+                                        #ok("Transaction broadcast successful")
+                                    };
+                                    case (?data) {
+                                        // Extract transactionId from data object
+                                        switch (data) {
+                                            case (#object_(data_fields)) {
+                                                for ((key, value) in data_fields.vals()) {
+                                                    if (key == "transactionId") {
+                                                        switch (value) {
+                                                            case (#string(tx_id)) { return #ok(tx_id) };
+                                                            case (_) {};
+                                                        };
+                                                    };
+                                                };
+                                                #ok("Transaction broadcast successful")
+                                            };
+                                            case (_) {
+                                                #ok("Transaction broadcast successful")
+                                            };
+                                        };
                                     };
                                 };
-                                // If no transaction ID found, return a generic success message
-                                #ok("Transaction broadcast successful")
                             };
                             case (_) {
                                 #err(Errors.internalError("Unexpected broadcast response format"))
@@ -1068,14 +1253,18 @@ module {
     };
 
     // Factory function for creating production wallet
-    public func createMainnetWallet(key_name: Text, prefix: ?Text) : Wallet {
+    public func createMainnetWallet(key_name: Text, prefix: ?Text, api_host: ?Text) : Wallet {
         let network_prefix = switch (prefix) {
             case (null) { "Hoosat" };
             case (?p) { p };
         };
+        let host = switch (api_host) {
+            case (null) { "https://api.hoosat.fi" };  // Default mainnet
+            case (?h) { h };
+        };
         let config: WalletConfig = {
             key_name = key_name;
-            api_host = "api.network.hoosat.fi";
+            api_host = host;
             network = "mainnet";
             prefix = network_prefix;
             max_fee = 1_000_000; // 0.01 HTN max fee
@@ -1084,14 +1273,18 @@ module {
         Wallet(config)
     };
 
-    public func createTestnetWallet(key_name: Text, prefix: ?Text) : Wallet {
+    public func createTestnetWallet(key_name: Text, prefix: ?Text, api_host: ?Text) : Wallet {
         let network_prefix = switch (prefix) {
             case (null) { "hoosattest" };  // Default testnet prefix
             case (?p) { p };
         };
+        let host = switch (api_host) {
+            case (null) { "https://proxy.hoosat.net/api/v1" };  // Default public testnet
+            case (?h) { h };
+        };
         let config: WalletConfig = {
             key_name = key_name;
-            api_host = "api-testnet.hoosat.fi";
+            api_host = host;
             network = "testnet";
             prefix = network_prefix;
             max_fee = 100_000_000_000; // Allow up to 1000 HTN for HRC20 deploys
@@ -1107,7 +1300,7 @@ module {
             api_host = api_host;
             network = network;
             prefix = prefix;
-            max_fee = 1_000_000;
+            max_fee = 10_000_000; // 0.1 HTN - enough for consolidation with 10+ inputs
             default_fee_rate = 1000;
         };
         Wallet(config)

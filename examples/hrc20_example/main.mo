@@ -45,6 +45,8 @@ import Nat64 "mo:base/Nat64";
 import Nat8 "mo:base/Nat8";
 import Array "mo:base/Array";
 import Error "mo:base/Error";
+import Iter "mo:base/Iter";
+import Nat "mo:base/Nat";
 
 import Wallet "../../src/wallet";
 import Errors "../../src/errors";
@@ -59,10 +61,17 @@ import HRC20Types "../../src/hrc20/types";
 import HRC20Operations "../../src/hrc20/operations";
 import HRC20Builder "../../src/hrc20/builder";
 
+import Config "./config";
+
 persistent actor HRC20Example {
 
-    // Initialize a testnet wallet
-    transient let wallet = Wallet.createTestnetWallet("dfx_test_key", null);
+    // Initialize a testnet wallet with configuration from config.mo
+    // To use a custom API endpoint, update TESTNET_API_HOST in config.mo
+    transient let wallet = Wallet.createTestnetWallet(
+        Config.DEFAULT_KEY_NAME,  // key_name
+        ?Config.TESTNET_PREFIX,   // prefix
+        ?Config.TESTNET_API_HOST  // api_host
+    );
 
     // Store pending reveals (survives upgrades)
     private stable var pendingReveals : [(Text, [Nat8])] = [];  // (commit_tx_id, redeem_script)
@@ -75,29 +84,71 @@ persistent actor HRC20Example {
     /// Consolidate UTXOs by sending all funds to self
     /// This is necessary when you have multiple small UTXOs and need one large one
     public func consolidateUTXOs(from_address: Text) : async Result.Result<Text, Errors.HoosatError> {
-        // Send almost all funds to self (leaving enough for fee)
-        let balance = switch (await wallet.getBalance(from_address)) {
-            case (#ok(bal)) { bal.confirmed };
+        // Get UTXOs to count inputs and calculate proper fee
+        let utxos = switch (await wallet.getUTXOs(from_address)) {
+            case (#ok(u)) { u };
             case (#err(e)) { return #err(e) };
         };
 
-        if (balance == 0) {
+        if (utxos.size() == 0) {
             return #err(#InsufficientFunds({ required = 1000; available = 0 }));
         };
 
-        // Leave 1,000,000 sompi (0.01 HTN) for fees
-        let fee_buffer: Nat64 = 1_000_000;
-        let amount_to_send = if (balance > fee_buffer) { balance - fee_buffer } else { return #err(#InsufficientFunds({ required = fee_buffer; available = balance })) };
+        // Sort UTXOs by amount (largest first) to match selectCoinsForTransaction logic
+        // This ensures we calculate fees and amounts from the same UTXOs that will be spent
+        let sorted_utxos = Array.sort<Types.UTXO>(
+            utxos,
+            func(a, b) { Nat64.compare(b.amount, a.amount) }
+        );
+
+        // Cap at max_utxos (10) to match selectCoinsForTransaction limit
+        let max_utxos = 10;
+        let input_count = Nat.min(sorted_utxos.size(), max_utxos);
+
+        // Calculate fee based on transaction size: inputs * 150 + outputs * 35 + 10 bytes
+        // With 10 input limit, max fee = (10 * 150 + 2 * 35 + 10) * 1000 = 1,570,000 sompi
+        // Add 20% margin for safety
+        let estimated_size = input_count * 150 + 2 * 35 + 10;
+        let fee_rate: Nat64 = 1000; // sompi per byte
+        let calculated_fee = Nat64.fromNat(estimated_size) * fee_rate;
+        let fee_buffer = calculated_fee + (calculated_fee / 5); // Add 20% margin
+
+        // Calculate total from LARGEST UTXOs (matching selectCoinsForTransaction)
+        var selected_total: Nat64 = 0;
+        for (i in Iter.range(0, input_count - 1)) {
+            selected_total += sorted_utxos[i].amount;
+        };
+
+        if (selected_total == 0) {
+            return #err(#InsufficientFunds({ required = fee_buffer; available = 0 }));
+        };
+
+        let amount_to_send = if (selected_total > fee_buffer) { 
+            selected_total - fee_buffer 
+        } else { 
+            return #err(#InsufficientFunds({ required = fee_buffer; available = selected_total })) 
+        };
+
+        // Use explicit fee to ensure it doesn't exceed max_fee
+        let explicit_fee = calculated_fee;
+
+        Debug.print("🔄 Consolidating " # debug_show(input_count) # " UTXOs with total: " # debug_show(selected_total));
 
         switch (await wallet.sendTransaction(
             from_address,
             from_address,  // Send to self
             amount_to_send,
-            null,  // Use default fee
+            ?explicit_fee,  // Use calculated fee
             null   // Use default derivation path
         )) {
-            case (#ok(result)) { #ok(result.transaction_id) };
-            case (#err(e)) { #err(e) };
+            case (#ok(result)) { 
+                Debug.print("✅ Consolidation complete. New UTXO amount: " # debug_show(amount_to_send));
+                #ok(result.transaction_id) 
+            };
+            case (#err(e)) { 
+                Debug.print("❌ Consolidation failed: " # debug_show(e));
+                #err(e) 
+            };
         }
     };
 
@@ -310,8 +361,14 @@ persistent actor HRC20Example {
     /// Get P2SH address from script hash
     ///
     /// Useful for constructing reveal transactions
-    public func getP2SHAddress(scriptHash: [Nat8]) : async Result.Result<Text, Errors.HoosatError> {
-        HRC20Builder.getP2SHAddress(2, scriptHash, "hoosat")
+    /// @param scriptHash - The redeem script hash
+    /// @param prefix - Optional network prefix (defaults to "hoosat" for mainnet, use "hoosattest" for testnet)
+    public func getP2SHAddress(scriptHash: [Nat8], prefix: ?Text) : async Result.Result<Text, Errors.HoosatError> {
+        let network_prefix = switch (prefix) {
+            case (?p) { p };
+            case (null) { "hoosat" };
+        };
+        HRC20Builder.getP2SHAddress(2, scriptHash, network_prefix)
     };
 
     /// Estimate fees for a HRC20 operation
@@ -454,33 +511,49 @@ persistent actor HRC20Example {
             }));
         };
 
-        // 6. Select UTXO with enough funds or combine multiple UTXOs
-        var selected_utxo = utxos[0];
-        let total_needed = deploy_fee + commit_amount;
-
-        label utxo_loop for (utxo in utxos.vals()) {
-            if (utxo.amount >= total_needed) {
-                selected_utxo := utxo;
-                break utxo_loop;
-            };
-            if (utxo.amount > selected_utxo.amount) {
-                selected_utxo := utxo;
+        // 6. Check if we have a large enough UTXO for deploy (need 2,100 HTN minimum)
+        let min_deploy_amount: Nat64 = 210_000_000_000; // 2,100 HTN
+        var largest_utxo = utxos[0];
+        
+        // Find the largest UTXO
+        for (utxo in utxos.vals()) {
+            if (utxo.amount > largest_utxo.amount) {
+                largest_utxo := utxo;
             };
         };
 
-        Debug.print("📊 Selected UTXO amount: " # debug_show(selected_utxo.amount));
-        Debug.print("💰 Commit amount: " # debug_show(commit_amount));
-        Debug.print("💸 Deploy fee: " # debug_show(deploy_fee));
+        Debug.print("📊 Largest UTXO amount: " # debug_show(largest_utxo.amount));
+        Debug.print("💰 Minimum required: " # debug_show(min_deploy_amount));
         Debug.print("📦 Total UTXOs available: " # debug_show(utxos.size()));
 
-        // Check if we need to consolidate UTXOs first
-        if (selected_utxo.amount < total_needed) {
-            Debug.print("⚠️  Single UTXO insufficient. Please consolidate UTXOs first.");
-            return #err(#InsufficientFunds({
-                required = total_needed;
-                available = selected_utxo.amount;
-            }));
+        // If largest UTXO is insufficient, consolidate first
+        if (largest_utxo.amount < min_deploy_amount) {
+            Debug.print("⚠️  Largest UTXO insufficient. Auto-consolidating UTXOs first...");
+            
+            // Attempt to consolidate UTXOs
+            switch (await consolidateUTXOs(addressInfo.address)) {
+                case (#ok(consolidation_tx_id)) {
+                    Debug.print("✅ Consolidation broadcast! TX ID: " # consolidation_tx_id);
+                    // Return a special result indicating consolidation happened
+                    return #ok({
+                        commit_tx_id = "PENDING_CONSOLIDATION:" # consolidation_tx_id;
+                        redeem_script_hex = "";
+                        p2sh_address = "";
+                        instructions = "⏳ Consolidation transaction broadcast: " # consolidation_tx_id # ".\n\nPlease wait ~10 seconds for confirmation, then run deploy again.";
+                    });
+                };
+                case (#err(e)) {
+                    Debug.print("❌ Consolidation failed: " # debug_show(e));
+                    return #err(e);
+                };
+            };
         };
+
+        // Use the largest UTXO for deploy
+        let selected_utxo = largest_utxo;
+        let total_needed = deploy_fee + commit_amount;
+
+        Debug.print("✅ Using UTXO with amount: " # debug_show(selected_utxo.amount));
 
         let commit_result = HRC20Builder.buildCommit(
             addressInfo.public_key,
@@ -742,8 +815,16 @@ persistent actor HRC20Example {
         Debug.print("📜 Redeem script (hex): " # Address.hexFromArray(redeem_script));
 
         // 2. Get P2SH address from the redeem script hash
+        // Detect network prefix from recipient address
+        let prefix = if (Text.startsWith(recipient_address, #text("hoosattest:"))) {
+            "hoosattest"
+        } else {
+            "hoosat"
+        };
+        Debug.print("🌐 Using network prefix: " # prefix);
+
         let scriptHash = ScriptBuilder.hashRedeemScript(redeem_script);
-        let p2sh_address = switch (HRC20Builder.getP2SHAddress(2, scriptHash, "hoosat")) {
+        let p2sh_address = switch (HRC20Builder.getP2SHAddress(2, scriptHash, prefix)) {
             case (#ok(addr)) { addr };
             case (#err(e)) { return #err(e) };
         };
